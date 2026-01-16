@@ -97,7 +97,9 @@
                 <div class="card-header d-flex justify-content-between align-items-center {{ 'bg-danger text-white' if not cam.online else '' }}">
                     <div class="d-flex align-items-center gap-2">
                         <strong>{{ cam.name }}</strong>
-                        <button class="btn btn-link p-0 text-white" style="text-decoration: none;" data-bs-toggle="modal" data-bs-target="#infoModal{{ cam.id }}">
+                        <button class="btn btn-link p-0 {{ 'text-white' if not cam.online else 'text-secondary' }}" 
+                                style="text-decoration: none;" 
+                                data-bs-toggle="modal" data-bs-target="#infoModal{{ cam.id }}">
                             <span style="font-size: 1.2rem;">ⓘ</span>
                         </button>
                     </div>
@@ -110,7 +112,7 @@
                 <div class="card-body text-center p-2">
                     <div style="position: relative; min-height: 200px; background: #eee;" class="rounded mb-2 d-flex align-items-center justify-content-center">
                         {% if cam.online %}
-                            <img src="/images/{{ cam.name }}.jpg?t={{ now }}" class="img-fluid rounded" 
+                            <img src="/images/{{ cam.file_name }}.jpg?t={{ now }}" class="img-fluid rounded" 
                                  style="max-height: 250px;"
                                  onerror="this.style.display='none'" alt="Latest Snap">
                         {% else %}
