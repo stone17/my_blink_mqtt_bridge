@@ -16,9 +16,15 @@ class BlinkService:
         self.creds_path = creds_path
         self.session = None
         self.blink = None
-        # Save images in /config/images so they persist and user can see them
+        # Save images in /config/images so they persist
         self.images_dir = "/config/images"
-        os.makedirs(self.images_dir, exist_ok=True)
+        
+        print(f"DEBUG: Initializing BlinkService. Image Directory: {self.images_dir}")
+        try:
+            os.makedirs(self.images_dir, exist_ok=True)
+            print(f"DEBUG: Verified/Created {self.images_dir}")
+        except Exception as e:
+            print(f"DEBUG: CRITICAL - Could not create image dir: {e}")
 
     async def start_session(self):
         if not self.session or self.session.closed:
@@ -46,6 +52,9 @@ class BlinkService:
         try:
             await self.blink.start()
             await self.blink.save(self.creds_path)
+            # Print Region Info to debug URL issues
+            if hasattr(self.blink, 'urls'):
+                print(f"DEBUG: Blink Base URL determined as: {self.blink.urls.base_url}")
             return "SUCCESS"
         except BlinkTwoFARequiredError:
             return "2FA_REQUIRED"
@@ -73,7 +82,6 @@ class BlinkService:
         if not self.blink: return False
         print(f"DEBUG: COMMAND -> {'ARM' if arm else 'DISARM'} System")
         try:
-            # Send command to all known sync modules
             for name, camera in self.blink.cameras.items():
                 sync_module_name = camera.attributes['sync_module']
                 if sync_module_name in self.blink.sync:
@@ -87,6 +95,7 @@ class BlinkService:
 
     async def refresh(self):
         if self.blink:
+            print("DEBUG: Refreshing Blink Data...")
             await self.blink.refresh(force_cache=True)
             await self.download_thumbnails()
 
@@ -94,33 +103,62 @@ class BlinkService:
         """Downloads thumbnails for ALL cameras found in raw homescreen data."""
         if not self.blink: return
         
-        print("DEBUG: Caching latest thumbnails to /config/images...")
+        print(f"DEBUG: Starting Thumbnail Download to {self.images_dir}...")
         
         # Collect all raw devices
         all_devices = []
         if hasattr(self.blink, 'homescreen'):
             for category in ['owls', 'cameras', 'doorbells', 'chickadees']:
-                all_devices.extend(self.blink.homescreen.get(category, []))
+                devs = self.blink.homescreen.get(category, [])
+                all_devices.extend(devs)
+                print(f"DEBUG: Found {len(devs)} devices in category '{category}'")
+
+        if not all_devices:
+            print("DEBUG: WARNING - No devices found in homescreen data to fetch images for.")
 
         for dev in all_devices:
             cam_id = str(dev.get('id'))
+            name = dev.get('name', 'Unknown')
             thumb_url = dev.get('thumbnail')
             
+            print(f"DEBUG: Processing Image for '{name}' (ID: {cam_id})...")
+            
             if thumb_url:
+                # Construct Full URL
                 if not thumb_url.startswith('http'):
                     base = "https://rest-prod.immedia-semi.com"
-                    if hasattr(self.blink, 'urls'): base = self.blink.urls.base_url
-                    thumb_url = f"{base}{thumb_url}"
-                
+                    if hasattr(self.blink, 'urls') and self.blink.urls.base_url: 
+                        base = self.blink.urls.base_url
+                    
+                    # Ensure no double slashes
+                    if base.endswith('/') and thumb_url.startswith('/'):
+                        thumb_url = thumb_url[1:]
+                    
+                    full_url = f"{base}{thumb_url}"
+                else:
+                    full_url = thumb_url
+
+                print(f"DEBUG:   > Constructed URL: {full_url}")
+
                 try:
-                    # Save as {ID}.jpg to avoid name collisions
                     path = f"{self.images_dir}/{cam_id}.jpg"
-                    async with self.session.get(thumb_url) as resp:
+                    async with self.session.get(full_url) as resp:
+                        print(f"DEBUG:   > HTTP Status: {resp.status}")
+                        
                         if resp.status == 200:
+                            data = await resp.read()
+                            size = len(data)
                             with open(path, 'wb') as f:
-                                f.write(await resp.read())
+                                f.write(data)
+                            print(f"DEBUG:   > SAVED: {path} ({size} bytes)")
+                        else:
+                            print(f"DEBUG:   > ERROR: Failed to fetch. Status {resp.status}")
+                            # Optional: print body if 404/403 to see error message
+                            # print(await resp.text())
                 except Exception as e:
-                    print(f"DEBUG: Failed to download thumb for ID {cam_id}: {e}")
+                    print(f"DEBUG:   > EXCEPTION downloading ID {cam_id}: {e}")
+            else:
+                print(f"DEBUG:   > NO THUMBNAIL URL found for this device.")
 
     async def get_status(self):
         if not self.blink: return {}
@@ -140,7 +178,7 @@ class BlinkService:
                     is_armed = True
                     break
         
-        # Build Camera List from Raw Data (Handles duplicates & missing items)
+        # Build Camera List from Raw Data
         raw_devices = []
         if hasattr(self.blink, 'homescreen'):
             for category in ['owls', 'cameras', 'doorbells', 'chickadees']:
@@ -158,7 +196,6 @@ class BlinkService:
             original_name = dev.get('name', 'Unknown')
             cam_id = str(dev.get('id'))
             
-            # Display Name Logic
             display_name = original_name
             if name_counts[original_name] > 1:
                 dev_type = dev.get('type', 'cam')
@@ -168,7 +205,6 @@ class BlinkService:
             if 'status' in dev:
                 online = (dev['status'] != 'offline')
 
-            # Try to get Temp from library object if it exists
             temp = 0
             for _, c_obj in self.blink.cameras.items():
                 if str(c_obj.camera_id) == cam_id:
@@ -177,7 +213,7 @@ class BlinkService:
 
             cameras.append({
                 "name": display_name,
-                "id": cam_id,           # Crucial: ID is now the key
+                "id": cam_id,
                 "serial": dev.get('serial'),
                 "temperature": temp,
                 "online": online,
@@ -197,14 +233,10 @@ class BlinkService:
         }
 
     async def snap_picture(self, target_id):
-        """
-        Takes a picture using Camera ID. 
-        Reconstructs camera object if missing from library due to duplicates.
-        """
         if not self.blink: return None
         target_id = str(target_id)
         
-        print(f"DEBUG: Looking for camera ID {target_id} to snap...")
+        print(f"DEBUG: Requesting SNAP for Camera ID {target_id}...")
 
         # 1. Try finding in loaded library objects
         target_cam = None
@@ -213,10 +245,9 @@ class BlinkService:
                 target_cam = cam
                 break
         
-        # 2. If not found (overwritten duplicate), reconstruct it manually
+        # 2. Reconstruct if missing
         if not target_cam:
-            print(f"DEBUG: Camera ID {target_id} not in library dict. Reconstructing...")
-            # Find raw data
+            print(f"DEBUG: Camera ID {target_id} not found in library objects. Attempting reconstruction...")
             raw_data = None
             if hasattr(self.blink, 'homescreen'):
                 for cat in ['owls', 'cameras', 'doorbells', 'chickadees']:
@@ -226,29 +257,28 @@ class BlinkService:
                             break
             
             if raw_data:
-                # Create temporary object to perform the API call
                 target_cam = BlinkCamera(self.blink)
                 target_cam.name = raw_data.get('name')
                 target_cam.camera_id = raw_data.get('id')
                 target_cam.network_id = raw_data.get('network_id')
                 target_cam.serial = raw_data.get('serial')
                 target_cam.product_type = raw_data.get('type')
+                print(f"DEBUG: Reconstructed camera object for {target_cam.name}")
             else:
-                print("DEBUG: Could not find raw data for this ID.")
+                print("DEBUG: ERROR - Could not find raw data for this ID to reconstruct.")
                 return None
 
-        # 3. Perform Snap
         try:
-            print(f"DEBUG: Snapping picture for {target_cam.name} (ID: {target_id})...")
+            print(f"DEBUG: Triggering API Snap command...")
             await target_cam.snap_picture()
             
-            # Refresh and download just this image
+            print("DEBUG: Snap command sent. Waiting for refresh...")
             await self.blink.refresh(force_cache=True)
             await self.download_thumbnails() 
             
             return f"/images/{target_id}.jpg"
         except Exception as e:
-            print(f"DEBUG: Snapshot failed: {e}")
+            print(f"DEBUG: Snapshot Exception: {e}")
             return None
 
     async def close(self):
