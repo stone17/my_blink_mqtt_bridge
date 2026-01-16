@@ -24,6 +24,14 @@
     </div>
     {% endif %}
 
+    {% if state == 'CONFIG_REQUIRED' or state == 'ERROR' %}
+    <div class="alert alert-danger shadow-sm">
+        <h4 class="alert-heading">⚠️ Setup Required</h4>
+        <p>Please enter your credentials below to start the connection.</p>
+        <button class="btn btn-danger" data-bs-toggle="collapse" data-bs-target="#cfg">Open Configuration</button>
+    </div>
+    {% endif %}
+
     {% if state == 'CONNECTED' %}
     <div class="card mb-4">
         <div class="card-body d-flex justify-content-between align-items-center">
@@ -63,28 +71,48 @@
     </div>
     {% endif %}
 
-<div class="mt-5">
+    <div class="mt-5">
         <button class="btn btn-outline-secondary btn-sm" data-bs-toggle="collapse" data-bs-target="#cfg">Configuration</button>
-        <div id="cfg" class="collapse mt-2">
+        <div id="cfg" class="collapse {{ 'show' if state == 'CONFIG_REQUIRED' else '' }} mt-2">
             <form action="/save_config" method="post" class="card card-body">
+                <h5 class="mb-3">MQTT Settings</h5>
+                <div class="row">
+                    <div class="col-md-4 mb-3">
+                        <label class="form-label">Broker IP</label>
+                        <input name="mqtt_broker" value="{{ config.mqtt_broker }}" class="form-control" required>
+                    </div>
+                    <div class="col-md-4 mb-3">
+                        <label class="form-label">Username</label>
+                        <input name="mqtt_username" value="{{ config.mqtt_username }}" class="form-control">
+                    </div>
+                    <div class="col-md-4 mb-3">
+                        <label class="form-label">Password</label>
+                        <input type="password" name="mqtt_password" value="{{ config.mqtt_password }}" class="form-control">
+                    </div>
+                </div>
+
+                <h5 class="mb-3 border-top pt-3">Blink Settings</h5>
                 <div class="row">
                     <div class="col-md-6 mb-3">
-                        <label class="form-label">MQTT Broker IP</label>
-                        <input name="mqtt_broker" value="{{ config.mqtt_broker }}" class="form-control" required>
+                        <label class="form-label">Email</label>
+                        <input name="blink_email" value="{{ config.blink_email }}" class="form-control">
+                    </div>
+                    <div class="col-md-6 mb-3">
+                        <label class="form-label">Password</label>
+                        <input type="password" name="blink_password" value="{{ config.blink_password }}" class="form-control">
                     </div>
                     <div class="col-md-6 mb-3">
                         <label class="form-label">Polling Interval (Seconds)</label>
                         <input type="number" name="poll_interval" value="{{ config.poll_interval }}" class="form-control" min="60" required>
-                        <div class="form-text">Default: 3600 (1 hour). Lowering this may block your account.</div>
                     </div>
                 </div>
-                <button class="btn btn-primary">Save Settings</button>
+                <button class="btn btn-primary">Save & Connect</button>
             </form>
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        // Simple auto-reload to update status
         setTimeout(() => location.reload(), 15000);
     </script>
 </body>

@@ -1,6 +1,6 @@
 import aiohttp
-import json
 import logging
+import os
 from blinkpy.blinkpy import Blink
 from blinkpy.auth import Auth, BlinkTwoFARequiredError
 from blinkpy.helpers.util import json_load
@@ -18,24 +18,40 @@ class BlinkService:
             self.session = aiohttp.ClientSession()
             self.blink = Blink(session=self.session)
 
-    async def login(self):
+    async def login(self, username=None, password=None):
         """
-        Returns: "SUCCESS", "2FA_REQUIRED", or "FAILED"
+        Attempts login. 
+        - If 'username'/'password' provided, uses those (First Run).
+        - If not, tries to load from 'creds_path'.
         """
         await self.start_session()
         
-        # Load credentials if they exist
-        try:
-            auth_data = await json_load(self.creds_path)
-            self.blink.auth = Auth(auth_data, session=self.session)
-            print("DEBUG: Loaded existing credentials.")
-        except Exception:
-            print("DEBUG: No existing credentials found.")
-            # If we had username/pass passed in, we would set them here, 
-            # but blinkpy relies on the Auth object or prompt. 
-            # We assume the config flow creates the initial Auth via file or we need to handle raw user/pass.
-            # For this bridge, we rely on the saved file or generating it.
-            pass
+        auth_data = None
+        
+        # 1. Try loading existing token
+        if os.path.exists(self.creds_path):
+            try:
+                auth_data = await json_load(self.creds_path)
+                print("DEBUG: Loaded existing credentials from file.")
+            except Exception:
+                print("DEBUG: Credential file corrupt or unreadable.")
+
+        # 2. If providing fresh credentials (first setup)
+        if username and password:
+            print(f"DEBUG: Using provided username/password for {username}")
+            auth_data = {
+                "username": username,
+                "password": password,
+                "login_url": "https://rest-prod.immedia-semi.com/login"
+            }
+
+        # 3. If we still have no data, we cannot start.
+        if not auth_data:
+            print("DEBUG: No credentials available. Waiting for user input.")
+            return "CONFIG_REQUIRED"
+
+        # 4. Initialize Auth with no_prompt=True to prevent CLI hang
+        self.blink.auth = Auth(auth_data, session=self.session, no_prompt=True)
 
         try:
             await self.blink.start()
@@ -50,12 +66,9 @@ class BlinkService:
             return "FAILED"
 
     async def validate_2fa(self, code):
-        """Submits the 2FA pin to Blink."""
         if not self.blink: return False
         try:
-            # Blinkpy's method to send the PIN
             await self.blink.auth.send_auth_key(self.blink, code)
-            # Try starting again to verify and save
             await self.blink.start()
             await self.blink.save(self.creds_path)
             return True
@@ -64,14 +77,11 @@ class BlinkService:
             return False
 
     async def arm_system(self, arm=True):
-        """Arms or Disarms all sync modules."""
         if not self.blink: return False
         try:
-            # Logic from your blink_test.py
             for name, camera in self.blink.cameras.items():
                 sync_name = camera.attributes['sync_module']
                 await self.blink.sync[sync_name].async_arm(arm)
-            
             await self.blink.refresh()
             return True
         except Exception as e:
@@ -83,23 +93,23 @@ class BlinkService:
             await self.blink.refresh()
 
     async def get_status(self):
-        """Returns simplified status for UI and MQTT."""
         if not self.blink: return {}
-        
-        # Determine global state (if any sync module is armed, we say armed)
         is_armed = False
-        for name, sync in self.blink.sync.items():
-            if sync.arm: is_armed = True
+        # Check all sync modules
+        if hasattr(self.blink, 'sync'):
+            for name, sync in self.blink.sync.items():
+                if sync.arm: is_armed = True
         
         cameras = []
-        for name, cam in self.blink.cameras.items():
-            cameras.append({
-                "name": name,
-                "id": cam.camera_id,
-                "serial": cam.serial,
-                "thumbnail": cam.attributes.get("thumbnail", ""),
-                "temperature": cam.attributes.get("temperature", 0)
-            })
+        if hasattr(self.blink, 'cameras'):
+            for name, cam in self.blink.cameras.items():
+                cameras.append({
+                    "name": name,
+                    "id": cam.camera_id,
+                    "serial": cam.serial,
+                    "thumbnail": cam.attributes.get("thumbnail", ""),
+                    "temperature": cam.attributes.get("temperature", 0)
+                })
 
         return {
             "armed": is_armed,
@@ -108,9 +118,7 @@ class BlinkService:
         }
 
     async def snap_picture(self, camera_name):
-        """Triggers a snapshot and saves it."""
         if not self.blink: return None
-        
         camera = self.blink.cameras.get(camera_name)
         if not camera: return None
 

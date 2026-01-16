@@ -7,7 +7,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import paho.mqtt.client as mqtt_client
@@ -23,7 +23,7 @@ logger = logging.getLogger("BlinkBridge")
 # --- GLOBAL STATE ---
 blink_svc = BlinkService(CREDS_PATH)
 latest_data = {"armed": False, "status_str": "Unknown", "cameras": []}
-system_state = "STARTING" # STARTING, CONNECTED, WAITING_2FA, ERROR
+system_state = "STARTING" 
 running = True
 
 # --- CONFIG MANAGER ---
@@ -35,12 +35,13 @@ class ConfigManager:
             "mqtt_port": int(os.getenv("MQTT_PORT", 1883)),
             "mqtt_username": "",
             "mqtt_password": "",
-            # Default to 1 hour (3600s) based on your previous script
             "poll_interval": 3600, 
-            "username": "",       
-            "password": ""
+            "blink_email": "",
+            "blink_password": ""
         }
         self.load()
+        # Force save on startup to ensure file exists
+        self.save()
 
     def load(self):
         if os.path.exists(self.filepath):
@@ -50,8 +51,10 @@ class ConfigManager:
             except Exception as e: logger.error(f"Config load error: {e}")
 
     def save(self):
-        with open(self.filepath, 'w') as f:
-            yaml.dump(self.data, f)
+        try:
+            with open(self.filepath, 'w') as f:
+                yaml.dump(self.data, f)
+        except Exception as e: logger.error(f"Config save error: {e}")
 
 cfg = ConfigManager(CONFIG_PATH)
 
@@ -66,6 +69,12 @@ class MqttHandler:
         try:
             broker = cfg.data['mqtt_broker']
             logger.info(f"Connecting to MQTT Broker: {broker}")
+            
+            user = cfg.data.get('mqtt_username')
+            pwd = cfg.data.get('mqtt_password')
+            if user and pwd:
+                self.client.username_pw_set(user, pwd)
+                
             self.client.connect(broker, int(cfg.data['mqtt_port']), 60)
             self.client.loop_start()
         except Exception as e: logger.error(f"MQTT Error: {e}")
@@ -73,8 +82,8 @@ class MqttHandler:
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             logger.info("MQTT Connected.")
-            client.subscribe("blink/command") # Payload: ARM / DISARM
-            client.subscribe("blink/camera/+/snap") # Payload: anything
+            client.subscribe("blink/command") 
+            client.subscribe("blink/camera/+/snap")
             self.publish_discovery()
         else:
             logger.error(f"MQTT Connect Failed code={rc}")
@@ -82,15 +91,13 @@ class MqttHandler:
     def on_message(self, client, userdata, msg):
         topic = msg.topic
         payload = msg.payload.decode().upper()
-        logger.info(f"MQTT Recv: {topic} {payload}")
-
+        
         if topic == "blink/command":
             if payload in ["ARM", "ARM_AWAY"]:
                 asyncio.run_coroutine_threadsafe(perform_action("arm"), loop)
             elif payload == "DISARM":
                 asyncio.run_coroutine_threadsafe(perform_action("disarm"), loop)
         
-        # Handle snapshot request: blink/camera/NAME/snap
         if "snap" in topic:
             try:
                 cam_name = topic.split("/")[2]
@@ -99,8 +106,6 @@ class MqttHandler:
 
     def publish_discovery(self):
         disc_prefix = "homeassistant"
-        
-        # Alarm Panel Entity
         payload = {
             "name": "Blink System",
             "unique_id": "blink_hub_main",
@@ -117,91 +122,69 @@ class MqttHandler:
         state = "armed_away" if latest_data["armed"] else "disarmed"
         self.client.publish("blink/state", state, retain=True)
         self.client.publish("blink/status", "online", retain=True)
-        
-        # Publish sensor data
         for cam in latest_data["cameras"]:
             clean_name = cam['name'].replace(" ", "_").lower()
-            # Temperature
             self.client.publish(f"blink/sensor/{clean_name}/temp", cam['temperature'])
-            
-            # Helper for HA Camera Generic (Optional)
-            # You can point a Generic Camera entity to http://<IP>:8000/images/<NAME>.jpg
-            
+
 mqtt = MqttHandler()
 
-# --- ACTIONS & TASKS ---
-
+# --- ACTIONS ---
 async def update_data():
-    """Fetches latest data from Blink service and pushes to MQTT."""
     global latest_data, system_state
     try:
-        # refresh() handles the token keep-alive internally
         await blink_svc.refresh()
         latest_data = await blink_svc.get_status()
         mqtt.publish_state()
         system_state = "CONNECTED"
     except Exception as e:
         logger.error(f"Update Data Failed: {e}")
-        # If we hit an auth error, we might need to flag 2FA
-        # Simple check: if get_status returns empty or refresh fails hard
-        # Ideally blink_service handles the specific 2FA exception
-        pass
 
 async def perform_action(action_type):
-    """Wrapper to perform action and immediately update status."""
-    if action_type == "arm":
-        await blink_svc.arm_system(True)
-    elif action_type == "disarm":
-        await blink_svc.arm_system(False)
-    
+    if action_type == "arm": await blink_svc.arm_system(True)
+    elif action_type == "disarm": await blink_svc.arm_system(False)
     await update_data()
 
 async def trigger_snap(cam_name):
-    """Takes a picture and updates."""
-    path = await blink_svc.snap_picture(cam_name)
-    if path:
-        logger.info(f"Snapshot saved to {path}")
-        # Optionally force a data refresh to get new thumbnail URL if applicable
-        await update_data()
+    await blink_svc.snap_picture(cam_name)
+    await update_data()
 
 async def poll_blink():
-    """Background loop: Login once, then poll periodically."""
-    global system_state, latest_data
-    
-    # Initial Login Attempt
+    global system_state
     while running:
         if system_state == "WAITING_2FA":
             await asyncio.sleep(5)
             continue
-
+            
         if system_state != "CONNECTED":
-            res = await blink_svc.login()
+            # Pass saved credentials if available
+            u = cfg.data.get("blink_email")
+            p = cfg.data.get("blink_password")
+            
+            res = await blink_svc.login(username=u, password=p)
+            
             if res == "SUCCESS":
                 system_state = "CONNECTED"
+                # Clear raw password from memory/config if desired, 
+                # but keep for now in case of re-login needs
                 await update_data()
             elif res == "2FA_REQUIRED":
                 system_state = "WAITING_2FA"
-                logger.warning("2FA Required. Please verify in Web UI.")
+            elif res == "CONFIG_REQUIRED":
+                system_state = "CONFIG_REQUIRED"
+                # Wait until config is saved
+                await asyncio.sleep(2)
+                continue
             else:
                 system_state = "ERROR"
-                await asyncio.sleep(30) # Retry delay on hard fail
+                await asyncio.sleep(30)
                 continue
 
-        # If connected, sleep for interval, then refresh
         interval = cfg.data.get("poll_interval", 3600)
         await asyncio.sleep(interval)
         
         if system_state == "CONNECTED":
-            logger.info("Performing scheduled keep-alive poll...")
-            # We call login() again lightly or just refresh. 
-            # calling blink_svc.refresh() inside update_data() is usually enough 
-            # if the token is valid. If invalid, blinkpy might raise 2FA error.
-            # A safe pattern is to re-check login if refresh fails, 
-            # but for simplicity we just call update_data which calls refresh.
-            try:
-                await update_data()
-            except:
-                system_state = "ERROR" # Trigger re-login logic next loop
+            try: await update_data()
+            except: system_state = "ERROR"
 
 # --- FASTAPI ---
 @asynccontextmanager
@@ -245,9 +228,29 @@ async def arm_route(action: str = Form(...)):
 
 @app.post("/save_config")
 async def save_config(
-    mqtt_broker: str = Form(...), poll_interval: int = Form(...)
+    mqtt_broker: str = Form(...), mqtt_username: str = Form(""), 
+    mqtt_password: str = Form(""), poll_interval: int = Form(...),
+    blink_email: str = Form(""), blink_password: str = Form("")
 ):
+    global system_state
+    
     cfg.data["mqtt_broker"] = mqtt_broker
+    cfg.data["mqtt_username"] = mqtt_username
+    cfg.data["mqtt_password"] = mqtt_password
     cfg.data["poll_interval"] = int(poll_interval)
+    
+    # Update Blink creds if provided
+    if blink_email: cfg.data["blink_email"] = blink_email
+    if blink_password: cfg.data["blink_password"] = blink_password
+    
     cfg.save()
+    
+    # Restart MQTT
+    mqtt.client.disconnect()
+    mqtt.start()
+    
+    # Trigger retry in loop
+    if system_state in ["ERROR", "CONFIG_REQUIRED"]:
+        system_state = "STARTING"
+        
     return RedirectResponse("/", status_code=303)
