@@ -112,7 +112,7 @@
                 <div class="card-body text-center p-2">
                     <div style="position: relative; min-height: 200px; background: #eee;" class="rounded mb-2 d-flex align-items-center justify-content-center">
                         {% if cam.online %}
-                            <img src="/images/{{ cam.file_name }}.jpg?t={{ now }}" class="img-fluid rounded" 
+                            <img src="/images/{{ cam.id }}.jpg?t={{ now }}" class="img-fluid rounded" 
                                  style="max-height: 250px;"
                                  onerror="this.style.display='none'" alt="Latest Snap">
                         {% else %}
@@ -120,7 +120,7 @@
                         {% endif %}
                     </div>
                     
-                    <form action="/snap/{{ cam.name }}" method="post">
+                    <form action="/snap/{{ cam.id }}" method="post">
                         <button class="btn btn-primary btn-sm w-100" {{ 'disabled' if not cam.online else '' }}>
                             📸 Take New Picture
                         </button>

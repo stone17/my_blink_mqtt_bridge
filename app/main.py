@@ -81,8 +81,8 @@ class MqttHandler:
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             logger.info("MQTT Connected.")
-            client.subscribe("blink/command")       # Alarm Panel Command
-            client.subscribe("blink/switch/set")    # Switch Command
+            client.subscribe("blink/command")
+            client.subscribe("blink/switch/set")
             client.subscribe("blink/camera/+/snap") 
             self.publish_discovery()
         else:
@@ -92,23 +92,20 @@ class MqttHandler:
         topic = msg.topic
         payload = msg.payload.decode().upper()
         
-        # 1. Alarm Panel Command (ARM / DISARM)
         if topic == "blink/command":
             if payload in ["ARM", "ARM_AWAY"]:
                 asyncio.run_coroutine_threadsafe(perform_action("arm"), loop)
             elif payload == "DISARM":
                 asyncio.run_coroutine_threadsafe(perform_action("disarm"), loop)
         
-        # 2. Switch Command (ON / OFF)
         if topic == "blink/switch/set":
-            if payload == "ON":
-                asyncio.run_coroutine_threadsafe(perform_action("arm"), loop)
-            elif payload == "OFF":
-                asyncio.run_coroutine_threadsafe(perform_action("disarm"), loop)
+            if payload == "ON": asyncio.run_coroutine_threadsafe(perform_action("arm"), loop)
+            elif payload == "OFF": asyncio.run_coroutine_threadsafe(perform_action("disarm"), loop)
 
-        # 3. Snapshot Command
         if "snap" in topic:
             try:
+                # Warning: MQTT still uses name in topic. 
+                # This logic assumes unique names or picks first match.
                 cam_name = topic.split("/")[2]
                 asyncio.run_coroutine_threadsafe(trigger_snap(cam_name), loop)
             except: pass
@@ -117,7 +114,6 @@ class MqttHandler:
         disc_prefix = "homeassistant"
         device_info = {"identifiers": ["blink_hub"], "name": "Blink Hub", "manufacturer": "Blink"}
         
-        # A. Alarm Panel Entity (Standard)
         panel_payload = {
             "name": "Blink System",
             "unique_id": "blink_hub_main",
@@ -132,7 +128,6 @@ class MqttHandler:
         }
         self.client.publish(f"{disc_prefix}/alarm_control_panel/blink_hub/config", json.dumps(panel_payload), retain=True)
 
-        # B. Switch Entity (For Domoticz/Simplicity)
         switch_payload = {
             "name": "Blink Arm/Disarm",
             "unique_id": "blink_hub_switch",
@@ -147,16 +142,12 @@ class MqttHandler:
         self.client.publish(f"{disc_prefix}/switch/blink_hub_switch/config", json.dumps(switch_payload), retain=True)
 
     def publish_state(self):
-        # 1. Update Alarm Panel State
         state = "armed_away" if latest_data["armed"] else "disarmed"
         self.client.publish("blink/state", state, retain=True)
-        
-        # 2. Update Switch State
         sw_state = "ON" if latest_data["armed"] else "OFF"
         self.client.publish("blink/switch/state", sw_state, retain=True)
-
-        # 3. Availability & Sensors
         self.client.publish("blink/status", "online", retain=True)
+        
         for cam in latest_data["cameras"]:
             clean_name = cam['name'].replace(" ", "_").lower()
             self.client.publish(f"blink/sensor/{clean_name}/temp", cam['temperature'])
@@ -179,8 +170,10 @@ async def perform_action(action_type):
     elif action_type == "disarm": await blink_svc.arm_system(False)
     await update_data()
 
-async def trigger_snap(cam_name):
-    await blink_svc.snap_picture(cam_name)
+async def trigger_snap(target_id):
+    # If passed a name via MQTT, we need to resolve it (basic logic)
+    # But UI passes ID now.
+    await blink_svc.snap_picture(target_id)
     await update_data()
 
 async def poll_blink():
@@ -193,9 +186,7 @@ async def poll_blink():
         if system_state != "CONNECTED":
             u = cfg.data.get("blink_email")
             p = cfg.data.get("blink_password")
-            
             res = await blink_svc.login(username=u, password=p)
-            
             if res == "SUCCESS":
                 system_state = "CONNECTED"
                 await update_data()
@@ -212,7 +203,6 @@ async def poll_blink():
 
         interval = cfg.data.get("poll_interval", 3600)
         await asyncio.sleep(interval)
-        
         if system_state == "CONNECTED":
             try: await update_data()
             except: system_state = "ERROR"
@@ -231,7 +221,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 templates = Jinja2Templates(directory="app/templates")
-app.mount("/images", StaticFiles(directory="/app/images"), name="images")
+
+# Point /images to the config folder
+app.mount("/images", StaticFiles(directory="/config/images"), name="images")
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -247,9 +239,9 @@ async def verify_2fa(code: str = Form(...)):
         await update_data()
     return RedirectResponse("/", status_code=303)
 
-@app.post("/snap/{name}")
-async def snap_route(name: str):
-    await trigger_snap(name)
+@app.post("/snap/{target_id}")
+async def snap_route(target_id: str):
+    await trigger_snap(target_id)
     return RedirectResponse("/", status_code=303)
 
 @app.post("/arm")
@@ -264,21 +256,15 @@ async def save_config(
     blink_email: str = Form(""), blink_password: str = Form("")
 ):
     global system_state
-    
     cfg.data["mqtt_broker"] = mqtt_broker
     cfg.data["mqtt_username"] = mqtt_username
     cfg.data["mqtt_password"] = mqtt_password
     cfg.data["poll_interval"] = int(poll_interval)
-    
     if blink_email: cfg.data["blink_email"] = blink_email
     if blink_password: cfg.data["blink_password"] = blink_password
-    
     cfg.save()
-    
     mqtt.client.disconnect()
     mqtt.start()
-    
     if system_state in ["ERROR", "CONFIG_REQUIRED"]:
         system_state = "STARTING"
-        
     return RedirectResponse("/", status_code=303)
