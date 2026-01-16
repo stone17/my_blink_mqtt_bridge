@@ -22,7 +22,7 @@ logger = logging.getLogger("BlinkBridge")
 
 # --- GLOBAL STATE ---
 blink_svc = BlinkService(CREDS_PATH)
-latest_data = {"armed": False, "status_str": "Unknown", "cameras": []}
+latest_data = {"armed": False, "status_str": "Unknown", "cameras": [], "raw_json": "{}"}
 system_state = "STARTING" 
 running = True
 
@@ -40,7 +40,6 @@ class ConfigManager:
             "blink_password": ""
         }
         self.load()
-        # Force save on startup to ensure file exists
         self.save()
 
     def load(self):
@@ -82,8 +81,9 @@ class MqttHandler:
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             logger.info("MQTT Connected.")
-            client.subscribe("blink/command") 
-            client.subscribe("blink/camera/+/snap")
+            client.subscribe("blink/command")       # Alarm Panel Command
+            client.subscribe("blink/switch/set")    # Switch Command
+            client.subscribe("blink/camera/+/snap") 
             self.publish_discovery()
         else:
             logger.error(f"MQTT Connect Failed code={rc}")
@@ -92,12 +92,21 @@ class MqttHandler:
         topic = msg.topic
         payload = msg.payload.decode().upper()
         
+        # 1. Alarm Panel Command (ARM / DISARM)
         if topic == "blink/command":
             if payload in ["ARM", "ARM_AWAY"]:
                 asyncio.run_coroutine_threadsafe(perform_action("arm"), loop)
             elif payload == "DISARM":
                 asyncio.run_coroutine_threadsafe(perform_action("disarm"), loop)
         
+        # 2. Switch Command (ON / OFF)
+        if topic == "blink/switch/set":
+            if payload == "ON":
+                asyncio.run_coroutine_threadsafe(perform_action("arm"), loop)
+            elif payload == "OFF":
+                asyncio.run_coroutine_threadsafe(perform_action("disarm"), loop)
+
+        # 3. Snapshot Command
         if "snap" in topic:
             try:
                 cam_name = topic.split("/")[2]
@@ -106,7 +115,10 @@ class MqttHandler:
 
     def publish_discovery(self):
         disc_prefix = "homeassistant"
-        payload = {
+        device_info = {"identifiers": ["blink_hub"], "name": "Blink Hub", "manufacturer": "Blink"}
+        
+        # A. Alarm Panel Entity (Standard)
+        panel_payload = {
             "name": "Blink System",
             "unique_id": "blink_hub_main",
             "command_topic": "blink/command",
@@ -114,13 +126,36 @@ class MqttHandler:
             "availability_topic": "blink/status",
             "payload_disarm": "DISARM",
             "payload_arm_away": "ARM_AWAY",
-            "device": {"identifiers": ["blink_hub"], "name": "Blink Hub", "manufacturer": "Blink"}
+            "code_arm_required": False,
+            "code_disarm_required": False,
+            "device": device_info
         }
-        self.client.publish(f"{disc_prefix}/alarm_control_panel/blink_hub/config", json.dumps(payload), retain=True)
+        self.client.publish(f"{disc_prefix}/alarm_control_panel/blink_hub/config", json.dumps(panel_payload), retain=True)
+
+        # B. Switch Entity (For Domoticz/Simplicity)
+        switch_payload = {
+            "name": "Blink Arm/Disarm",
+            "unique_id": "blink_hub_switch",
+            "command_topic": "blink/switch/set",
+            "state_topic": "blink/switch/state",
+            "availability_topic": "blink/status",
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "icon": "mdi:security",
+            "device": device_info
+        }
+        self.client.publish(f"{disc_prefix}/switch/blink_hub_switch/config", json.dumps(switch_payload), retain=True)
 
     def publish_state(self):
+        # 1. Update Alarm Panel State
         state = "armed_away" if latest_data["armed"] else "disarmed"
         self.client.publish("blink/state", state, retain=True)
+        
+        # 2. Update Switch State
+        sw_state = "ON" if latest_data["armed"] else "OFF"
+        self.client.publish("blink/switch/state", sw_state, retain=True)
+
+        # 3. Availability & Sensors
         self.client.publish("blink/status", "online", retain=True)
         for cam in latest_data["cameras"]:
             clean_name = cam['name'].replace(" ", "_").lower()
@@ -156,7 +191,6 @@ async def poll_blink():
             continue
             
         if system_state != "CONNECTED":
-            # Pass saved credentials if available
             u = cfg.data.get("blink_email")
             p = cfg.data.get("blink_password")
             
@@ -164,14 +198,11 @@ async def poll_blink():
             
             if res == "SUCCESS":
                 system_state = "CONNECTED"
-                # Clear raw password from memory/config if desired, 
-                # but keep for now in case of re-login needs
                 await update_data()
             elif res == "2FA_REQUIRED":
                 system_state = "WAITING_2FA"
             elif res == "CONFIG_REQUIRED":
                 system_state = "CONFIG_REQUIRED"
-                # Wait until config is saved
                 await asyncio.sleep(2)
                 continue
             else:
@@ -205,11 +236,7 @@ app.mount("/images", StaticFiles(directory="/app/images"), name="images")
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {
-        "request": request, 
-        "state": system_state, 
-        "data": latest_data, 
-        "config": cfg.data,
-        "now": int(time.time())  # <--- ADD THIS LINE
+        "request": request, "state": system_state, "data": latest_data, "config": cfg.data, "now": int(time.time())
     })
 
 @app.post("/verify_2fa")
@@ -243,17 +270,14 @@ async def save_config(
     cfg.data["mqtt_password"] = mqtt_password
     cfg.data["poll_interval"] = int(poll_interval)
     
-    # Update Blink creds if provided
     if blink_email: cfg.data["blink_email"] = blink_email
     if blink_password: cfg.data["blink_password"] = blink_password
     
     cfg.save()
     
-    # Restart MQTT
     mqtt.client.disconnect()
     mqtt.start()
     
-    # Trigger retry in loop
     if system_state in ["ERROR", "CONFIG_REQUIRED"]:
         system_state = "STARTING"
         
