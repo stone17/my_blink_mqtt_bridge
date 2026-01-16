@@ -1,6 +1,7 @@
 import aiohttp
 import logging
 import os
+import json  # <--- Added
 from unittest.mock import patch
 from blinkpy.blinkpy import Blink
 from blinkpy.auth import Auth, BlinkTwoFARequiredError
@@ -21,26 +22,33 @@ class BlinkService:
 
     async def login(self, username=None, password=None):
         """
-        Logs in using the 'promptless' flow described in documentation.
+        Logs in. Prioritizes existing credential file to avoid repeated 2FA.
         """
         await self.start_session()
         
         auth_data = None
+        
+        # 1. Try loading existing token from file FIRST
         if os.path.exists(self.creds_path):
             try:
                 auth_data = await json_load(self.creds_path)
-            except: pass
+                print("DEBUG: Loaded existing credentials from file.")
+            except Exception as e: 
+                print(f"DEBUG: Failed to load existing credentials file: {e}")
 
-        if username and password:
-            print(f"DEBUG: Using provided credentials for {username}")
+        # 2. Only use provided username/password if we DO NOT have a valid token file
+        if not auth_data and username and password:
+            print(f"DEBUG: No token file found. Using provided credentials for {username}")
             auth_data = {
                 "username": username,
                 "password": password,
             }
 
         if not auth_data:
+            print("DEBUG: No auth data available (no file and no config credentials).")
             return "CONFIG_REQUIRED"
 
+        # Initialize Auth
         self.blink.auth = Auth(auth_data, session=self.session, no_prompt=True)
 
         try:
@@ -48,7 +56,7 @@ class BlinkService:
             await self.blink.save(self.creds_path)
             return "SUCCESS"
         except BlinkTwoFARequiredError:
-            print("DEBUG: 2FA Required (Headless Flow).")
+            print("DEBUG: 2FA Required.")
             return "2FA_REQUIRED"
         except Exception as e:
             print(f"DEBUG: Login failed: {e}")
@@ -79,30 +87,19 @@ class BlinkService:
             return False
 
     async def arm_system(self, arm=True):
-        """
-        Exact implementation from your blink_test.py
-        """
         if not self.blink: return False
         
         print(f"DEBUG: COMMAND -> {'ARM' if arm else 'DISARM'} System")
         try:
-            # 1. Iterate through cameras to find sync modules and arm them
-            # (Matches logic in your blink_test.py)
+            # Logic from your blink_test.py
             for name, camera in self.blink.cameras.items():
                 sync_module_name = camera.attributes['sync_module']
-                print(f"DEBUG: Sending command to Sync Module '{sync_module_name}' (via camera '{name}')...")
-                
-                # Check if sync module exists in the map
                 if sync_module_name in self.blink.sync:
                     await self.blink.sync[sync_module_name].async_arm(arm)
-                else:
-                    print(f"DEBUG: WARNING - Sync module '{sync_module_name}' not found in blink.sync keys!")
-
-            # 2. Refresh from server to confirm
-            print("DEBUG: Refreshing status from server...")
+            
             await self.blink.refresh()
 
-            # 3. Print verification (Matches your blink_test.py verification loop)
+            # Verification debug
             for name, camera in self.blink.cameras.items():
                 sync_module_name = camera.attributes['sync_module']
                 if sync_module_name in self.blink.sync:
@@ -116,57 +113,68 @@ class BlinkService:
 
     async def refresh(self):
         if self.blink:
-            # This is crucial: updates local state from Blink servers
             await self.blink.refresh()
 
     async def get_status(self):
-        """
-        Replicates the logic from blink_test.py list_cameras() to determine status.
-        """
         if not self.blink: return {}
         
-        # Always refresh before reading status to ensure it's not stale
-        # (Your script calls blink.refresh() inside list_cameras)
-        await self.blink.refresh()
+        try:
+            await self.blink.refresh()
+        except Exception as e:
+            print(f"DEBUG: Refresh failed during status check: {e}")
 
         is_armed = False
         cameras = []
-
-        print("DEBUG: --- STATUS CHECK ---")
         
-        # Iterate cameras to get sync module status (User's method)
+        # --- DEBUG DATA COLLECTION ---
+        debug_data = {
+            "sync_modules": {},
+            "cameras": {}
+        }
+        # -----------------------------
+
         if hasattr(self.blink, 'cameras'):
             for name, cam in self.blink.cameras.items():
                 
-                # Camera Details
+                # Check online status
+                online = True
+                if hasattr(cam, 'online'):
+                    online = cam.online
+                elif 'status' in cam.attributes:
+                    online = (cam.attributes['status'] == 'online')
+
                 cameras.append({
                     "name": name,
                     "id": cam.camera_id,
                     "serial": cam.serial,
                     "thumbnail": cam.attributes.get("thumbnail", ""),
-                    "temperature": cam.attributes.get("temperature", 0)
+                    "temperature": cam.attributes.get("temperature", 0),
+                    "online": online
                 })
+                
+                # Add to debug dump
+                debug_data["cameras"][name] = cam.attributes
 
-                # Sync Module Status
+                # Check Sync Module Arm Status
                 sync_name = cam.attributes.get('sync_module')
                 if sync_name and hasattr(self.blink, 'sync') and sync_name in self.blink.sync:
                     sync_obj = self.blink.sync[sync_name]
-                    print(f"DEBUG: Camera '{name}' -> Sync '{sync_name}' -> Armed: {sync_obj.arm}")
                     
-                    # If ANY sync module is armed, we consider the system armed
+                    # Capture Sync Module Data for Debug
+                    if sync_name not in debug_data["sync_modules"]:
+                        debug_data["sync_modules"][sync_name] = {
+                            "arm_property": sync_obj.arm,
+                            "attributes": sync_obj.attributes
+                        }
+
                     if sync_obj.arm:
                         is_armed = True
-                else:
-                    print(f"DEBUG: Camera '{name}' has unknown sync module '{sync_name}'")
-
-        status_str = "Armed" if is_armed else "Disarmed"
-        print(f"DEBUG: Calculated Global System Status: {status_str}")
-        print("DEBUG: -----------------------")
 
         return {
             "armed": is_armed,
-            "status_str": status_str,
-            "cameras": cameras
+            "status_str": "Armed" if is_armed else "Disarmed",
+            "cameras": cameras,
+            "raw_json": json.dumps(debug_data, indent=2, default=str) # <--- Passed to UI
         }
 
     async def snap_picture(self, camera_name):
