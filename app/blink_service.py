@@ -2,6 +2,7 @@ import aiohttp
 import logging
 import os
 import json
+import shutil
 from unittest.mock import patch
 from blinkpy.blinkpy import Blink
 from blinkpy.camera import BlinkCamera
@@ -15,7 +16,10 @@ class BlinkService:
         self.creds_path = creds_path
         self.session = None
         self.blink = None
+        # Save images in /config/images so they persist
         self.images_dir = "/config/images"
+        
+        print(f"DEBUG: Initializing BlinkService. Image Directory: {self.images_dir}")
         try:
             os.makedirs(self.images_dir, exist_ok=True)
         except Exception as e:
@@ -47,6 +51,8 @@ class BlinkService:
         try:
             await self.blink.start()
             await self.blink.save(self.creds_path)
+            if hasattr(self.blink, 'urls'):
+                print(f"DEBUG: Blink Base URL determined as: {self.blink.urls.base_url}")
             return "SUCCESS"
         except BlinkTwoFARequiredError:
             return "2FA_REQUIRED"
@@ -70,63 +76,14 @@ class BlinkService:
             print(f"DEBUG: 2FA Validation Failed: {e}")
             return False
 
-    def _get_all_cameras(self):
-        """
-        Helper: Generates BlinkCamera objects for ALL devices in raw data.
-        This includes duplicates that might be missing from blink.cameras.
-        """
-        if not self.blink or not hasattr(self.blink, 'homescreen'): 
-            return []
-
-        all_objs = []
-        # Categories that contain cameras
-        for category in ['owls', 'cameras', 'doorbells', 'chickadees']:
-            raw_list = self.blink.homescreen.get(category, [])
-            for raw_data in raw_list:
-                # Instantiate a clean BlinkCamera object using the library
-                cam = BlinkCamera(self.blink)
-                # Populate it using the library's internal update method
-                cam.update(raw_data)
-                all_objs.append(cam)
-        return all_objs
-
-    async def download_thumbnails(self):
-        """
-        Uses the native blinkpy image_to_file method to save thumbnails.
-        """
-        print(f"DEBUG: Downloading thumbnails to {self.images_dir}...")
-        
-        cameras = self._get_all_cameras()
-        if not cameras:
-            print("DEBUG: No cameras found to download.")
-            return
-
-        for cam in cameras:
-            try:
-                # Save as {ID}.jpg
-                path = f"{self.images_dir}/{cam.camera_id}.jpg"
-                
-                # NATIVE METHOD: Handles auth, headers, and URLs automatically
-                await cam.image_to_file(path)
-                
-                print(f"DEBUG: Saved {cam.name} -> {path}")
-            except Exception as e:
-                print(f"DEBUG: Failed to save image for {cam.name}: {e}")
-
     async def arm_system(self, arm=True):
         if not self.blink: return False
         print(f"DEBUG: COMMAND -> {'ARM' if arm else 'DISARM'} System")
         try:
-            # Send command to all sync modules found
-            cameras = self._get_all_cameras()
-            processed_syncs = set()
-            
-            for cam in cameras:
-                # We need to find the sync module associated with this camera
-                sync_name = cam.attributes.get('sync_module')
-                if sync_name and sync_name in self.blink.sync and sync_name not in processed_syncs:
-                    await self.blink.sync[sync_name].async_arm(arm)
-                    processed_syncs.add(sync_name)
+            for name, camera in self.blink.cameras.items():
+                sync_module_name = camera.attributes['sync_module']
+                if sync_module_name in self.blink.sync:
+                    await self.blink.sync[sync_module_name].async_arm(arm)
             
             await self.blink.refresh(force_cache=True)
             return True
@@ -136,65 +93,127 @@ class BlinkService:
 
     async def refresh(self):
         if self.blink:
-            print("DEBUG: Refreshing Data & Thumbnails...")
+            print("DEBUG: Refreshing Blink Data...")
             await self.blink.refresh(force_cache=True)
             await self.download_thumbnails()
+
+    async def download_thumbnails(self):
+        """Downloads thumbnails for ALL cameras found in raw homescreen data."""
+        if not self.blink: return
+        
+        print(f"DEBUG: Starting Thumbnail Download to {self.images_dir}...")
+        
+        # --- FIX: Retrieve Auth Headers ---
+        # The 401 error happens because we weren't passing these headers!
+        headers = self.blink.auth.header
+        # ----------------------------------
+
+        all_devices = []
+        if hasattr(self.blink, 'homescreen'):
+            for category in ['owls', 'cameras', 'doorbells', 'chickadees']:
+                devs = self.blink.homescreen.get(category, [])
+                all_devices.extend(devs)
+
+        for dev in all_devices:
+            cam_id = str(dev.get('id'))
+            name = dev.get('name', 'Unknown')
+            thumb_url = dev.get('thumbnail')
+            
+            if thumb_url:
+                # Construct Full URL
+                if not thumb_url.startswith('http'):
+                    base = "https://rest-prod.immedia-semi.com"
+                    if hasattr(self.blink, 'urls') and self.blink.urls.base_url: 
+                        base = self.blink.urls.base_url
+                    
+                    if base.endswith('/') and thumb_url.startswith('/'):
+                        thumb_url = thumb_url[1:]
+                    
+                    full_url = f"{base}{thumb_url}"
+                else:
+                    full_url = thumb_url
+
+                try:
+                    path = f"{self.images_dir}/{cam_id}.jpg"
+                    
+                    # --- FIX: Pass headers here ---
+                    async with self.session.get(full_url, headers=headers) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            with open(path, 'wb') as f:
+                                f.write(data)
+                            print(f"DEBUG:   > SAVED: {name} -> {path} ({len(data)} bytes)")
+                        else:
+                            print(f"DEBUG:   > ERROR fetching {name}: HTTP {resp.status}")
+                except Exception as e:
+                    print(f"DEBUG:   > EXCEPTION downloading {name}: {e}")
 
     async def get_status(self):
         if not self.blink: return {}
         
         try:
-            await self.refresh()
+            await self.refresh() 
         except Exception as e:
             print(f"DEBUG: Refresh failed: {e}")
 
         is_armed = False
+        cameras = []
         
-        # Check Global Arm Status
         if hasattr(self.blink, 'homescreen') and 'networks' in self.blink.homescreen:
             for net in self.blink.homescreen['networks']:
                 if net.get('armed') is True:
                     is_armed = True
                     break
         
-        # Build Camera List using our robust helper
-        cameras_list = []
-        raw_objs = self._get_all_cameras()
-        
-        # Handle duplicate names for display
-        name_counts = {}
-        for c in raw_objs:
-            name_counts[c.name] = name_counts.get(c.name, 0) + 1
+        raw_devices = []
+        if hasattr(self.blink, 'homescreen'):
+            for category in ['owls', 'cameras', 'doorbells', 'chickadees']:
+                for item in self.blink.homescreen.get(category, []):
+                    item['category_type'] = category
+                    raw_devices.append(item)
 
-        for cam in raw_objs:
-            display_name = cam.name
-            if name_counts[cam.name] > 1:
-                display_name = f"{cam.name} ({cam.product_type})"
+        name_counts = {}
+        for d in raw_devices:
+            n = d.get('name', 'Unknown')
+            name_counts[n] = name_counts.get(n, 0) + 1
+
+        for dev in raw_devices:
+            original_name = dev.get('name', 'Unknown')
+            cam_id = str(dev.get('id'))
             
-            # Robust online check
-            # library 'status' attribute is sometimes messy, check raw if needed
+            display_name = original_name
+            if name_counts[original_name] > 1:
+                dev_type = dev.get('type', 'cam')
+                display_name = f"{original_name} ({dev_type})"
+            
             online = True
-            if cam.attributes.get('status') == 'offline':
-                online = False
-            
-            cameras_list.append({
+            if 'status' in dev:
+                online = (dev['status'] != 'offline')
+
+            temp = 0
+            for _, c_obj in self.blink.cameras.items():
+                if str(c_obj.camera_id) == cam_id:
+                    temp = c_obj.attributes.get('temperature', 0)
+                    break
+
+            cameras.append({
                 "name": display_name,
-                "id": str(cam.camera_id),
-                "serial": cam.serial,
-                "temperature": cam.attributes.get('temperature', 0),
+                "id": cam_id,
+                "serial": dev.get('serial'),
+                "temperature": temp,
                 "online": online,
-                "raw_json": json.dumps(cam.attributes, indent=2, default=str)
+                "raw_json": json.dumps(dev, indent=2, default=str)
             })
 
         debug_data = {
             "networks_raw": self.blink.homescreen.get('networks', []) if hasattr(self.blink, 'homescreen') else "No Data",
-            "camera_count": len(raw_objs)
+            "all_raw_devices": raw_devices
         }
 
         return {
             "armed": is_armed,
             "status_str": "Armed" if is_armed else "Disarmed",
-            "cameras": cameras_list,
+            "cameras": cameras,
             "raw_json": json.dumps(debug_data, indent=2, default=str)
         }
 
@@ -204,28 +223,36 @@ class BlinkService:
         
         print(f"DEBUG: Requesting SNAP for Camera ID {target_id}...")
 
-        # Find the correct camera object
         target_cam = None
-        for cam in self._get_all_cameras():
+        for _, cam in self.blink.cameras.items():
             if str(cam.camera_id) == target_id:
                 target_cam = cam
                 break
         
         if not target_cam:
-            print("DEBUG: Camera ID not found.")
-            return None
+            print(f"DEBUG: Reconstructing camera object for ID {target_id}...")
+            raw_data = None
+            if hasattr(self.blink, 'homescreen'):
+                for cat in ['owls', 'cameras', 'doorbells', 'chickadees']:
+                    for item in self.blink.homescreen.get(cat, []):
+                        if str(item.get('id')) == target_id:
+                            raw_data = item
+                            break
+            
+            if raw_data:
+                target_cam = BlinkCamera(self.blink)
+                target_cam.name = raw_data.get('name')
+                target_cam.camera_id = raw_data.get('id')
+                target_cam.network_id = raw_data.get('network_id')
+                target_cam.serial = raw_data.get('serial')
+                target_cam.product_type = raw_data.get('type')
+            else:
+                return None
 
         try:
-            # Use native method
             await target_cam.snap_picture()
-            
-            # Refresh to update link
             await self.blink.refresh(force_cache=True)
-            
-            # Download just this image using native method
-            path = f"{self.images_dir}/{target_id}.jpg"
-            await target_cam.image_to_file(path)
-            
+            await self.download_thumbnails() 
             return f"/images/{target_id}.jpg"
         except Exception as e:
             print(f"DEBUG: Snapshot Exception: {e}")
