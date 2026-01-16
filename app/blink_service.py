@@ -69,14 +69,13 @@ class BlinkService:
         
         print(f"DEBUG: COMMAND -> {'ARM' if arm else 'DISARM'} System")
         try:
-            # 1. Send the command to all sync modules (this works for your setup)
+            # 1. Command Sync Modules
             for name, camera in self.blink.cameras.items():
                 sync_module_name = camera.attributes['sync_module']
                 if sync_module_name in self.blink.sync:
                     await self.blink.sync[sync_module_name].async_arm(arm)
             
-            # 2. CRITICAL: Force a network-wide refresh to update the 'homescreen' data
-            # 'force_cache=True' is required to get the new 'armed' state from the server
+            # 2. Refresh to update global status
             await self.blink.refresh(force_cache=True)
             return True
         except Exception as e:
@@ -85,14 +84,12 @@ class BlinkService:
 
     async def refresh(self):
         if self.blink:
-            # We use force_cache=True to ensure we get the latest JSON from Blink
             await self.blink.refresh(force_cache=True)
 
     async def get_status(self):
         if not self.blink: return {}
         
         try:
-            # Always refresh with force_cache to get the real status
             await self.blink.refresh(force_cache=True)
         except Exception as e:
             print(f"DEBUG: Refresh failed: {e}")
@@ -100,38 +97,49 @@ class BlinkService:
         is_armed = False
         cameras = []
         
-        # --- FIX: READ ARMED STATUS FROM HOMESCREEN RAW DATA ---
-        # The library property is failing, so we look at the raw JSON response directly.
+        # --- 1. DETERMINE SYSTEM ARM STATE ---
         if hasattr(self.blink, 'homescreen') and 'networks' in self.blink.homescreen:
             for net in self.blink.homescreen['networks']:
                 if net.get('armed') is True:
                     is_armed = True
-                    # If any network is armed, we treat the whole system as armed
                     break
-        # -------------------------------------------------------
+        
+        # --- 2. BUILD RAW LOOKUP MAP ---
+        # Map Camera ID -> Raw JSON Data (contains the real 'status')
+        raw_map = {}
+        if hasattr(self.blink, 'homescreen'):
+            # Blink puts devices in different lists based on type
+            for category in ['owls', 'cameras', 'doorbells', 'chickadees']:
+                for item in self.blink.homescreen.get(category, []):
+                    # Convert ID to string for reliable matching
+                    raw_map[str(item.get('id'))] = item
 
+        # --- 3. BUILD CAMERA LIST ---
         if hasattr(self.blink, 'cameras'):
             for name, cam in self.blink.cameras.items():
                 
-                # Check online status (robust check)
+                # Find raw data for this camera
+                cam_id = str(cam.camera_id)
+                raw_info = raw_map.get(cam_id, {})
+                
+                # Determine Online Status from Raw Data
+                # Status is usually 'online' or 'offline'
                 online = True
-                if hasattr(cam, 'online'): online = cam.online
-                elif 'status' in cam.attributes: 
-                    # If status is "offline" string or False boolean
-                    val = cam.attributes['status']
-                    if val == 'offline' or val is False:
-                        online = False
-
+                if 'status' in raw_info:
+                    online = (raw_info['status'] != 'offline')
+                
                 cameras.append({
                     "name": name,
                     "id": cam.camera_id,
                     "serial": cam.serial,
                     "thumbnail": cam.attributes.get("thumbnail", ""),
                     "temperature": cam.attributes.get("temperature", 0),
-                    "online": online
+                    "online": online,
+                    # Pass pretty-printed JSON to the UI
+                    "raw_json": json.dumps(raw_info, indent=2, default=str)
                 })
 
-        # Debug dump for the UI 🐞 button
+        # Debug dump for the global 🐞 button
         debug_data = {
             "networks_raw": self.blink.homescreen.get('networks', []) if hasattr(self.blink, 'homescreen') else "No Data",
             "derived_status": "Armed" if is_armed else "Disarmed"

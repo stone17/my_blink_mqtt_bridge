@@ -95,7 +95,12 @@
         <div class="col-md-4">
             <div class="card shadow-sm h-100 {{ 'offline-cam' if not cam.online else '' }}">
                 <div class="card-header d-flex justify-content-between align-items-center {{ 'bg-danger text-white' if not cam.online else '' }}">
-                    <strong>{{ cam.name }}</strong>
+                    <div class="d-flex align-items-center gap-2">
+                        <strong>{{ cam.name }}</strong>
+                        <button class="btn btn-link p-0 text-white" style="text-decoration: none;" data-bs-toggle="modal" data-bs-target="#infoModal{{ cam.id }}">
+                            <span style="font-size: 1.2rem;">ⓘ</span>
+                        </button>
+                    </div>
                     {% if cam.online %}
                         <span class="badge bg-light text-dark">{{ cam.temperature }}°C</span>
                     {% else %}
@@ -120,6 +125,20 @@
                     </form>
                 </div>
             </div>
+            
+            <div class="modal fade" id="infoModal{{ cam.id }}" tabindex="-1" aria-hidden="true">
+                <div class="modal-dialog modal-lg">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title">{{ cam.name }} - Raw Details</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                        </div>
+                        <div class="modal-body bg-dark text-white p-3">
+                            <pre><code>{{ cam.raw_json }}</code></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
         {% endfor %}
     </div>
@@ -129,7 +148,7 @@
         <div class="modal-dialog modal-xl">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h5 class="modal-title">🐞 Raw Device Data</h5>
+                    <h5 class="modal-title">🐞 Global System Data</h5>
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
                 </div>
                 <div class="modal-body bg-dark text-white p-3">
