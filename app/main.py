@@ -13,6 +13,7 @@ from fastapi.templating import Jinja2Templates
 import paho.mqtt.client as mqtt_client
 
 from app.blink_service import BlinkService
+from app import security
 
 # --- CONFIG ---
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config/blink_config.yaml")
@@ -30,6 +31,7 @@ running = True
 class ConfigManager:
     def __init__(self, filepath):
         self.filepath = filepath
+        # Internal data holds PLAIN text passwords for use by the app
         self.data = {
             "mqtt_broker": os.getenv("MQTT_BROKER", "192.168.0.100"),
             "mqtt_port": int(os.getenv("MQTT_PORT", 1883)),
@@ -40,19 +42,51 @@ class ConfigManager:
             "blink_password": ""
         }
         self.load()
+        # Save immediately to ensure file exists and passwords get encrypted if they were defaults
         self.save()
 
     def load(self):
         if os.path.exists(self.filepath):
             try:
                 with open(self.filepath, 'r') as f:
-                    self.data.update(yaml.safe_load(f) or {})
+                    file_data = yaml.safe_load(f) or {}
+                
+                # Merge non-password fields directly
+                for k, v in file_data.items():
+                    if k not in ["mqtt_password", "blink_password"]:
+                        self.data[k] = v
+                
+                # Handle Passwords: Try decrypt, fallback to plain (migration support)
+                for pwd_field in ["mqtt_password", "blink_password"]:
+                    raw_val = file_data.get(pwd_field)
+                    if raw_val:
+                        decrypted = security.decrypt_password(raw_val)
+                        if decrypted:
+                            self.data[pwd_field] = decrypted
+                        else:
+                            # If decrypt fails, assume it's plain text (user edited file manually)
+                            self.data[pwd_field] = raw_val
+                            
             except Exception as e: logger.error(f"Config load error: {e}")
 
     def save(self):
         try:
+            # Create a copy to modify for storage without affecting running app
+            storage_data = self.data.copy()
+            
+            # Encrypt passwords before writing to disk
+            for pwd_field in ["mqtt_password", "blink_password"]:
+                plain = storage_data.get(pwd_field)
+                if plain:
+                    encrypted = security.encrypt_password(plain)
+                    if encrypted:
+                        storage_data[pwd_field] = encrypted
+                    else:
+                        logger.error(f"Failed to encrypt {pwd_field}, not saving it to avoid leak.")
+                        del storage_data[pwd_field]
+
             with open(self.filepath, 'w') as f:
-                yaml.dump(self.data, f)
+                yaml.dump(storage_data, f)
         except Exception as e: logger.error(f"Config save error: {e}")
 
 cfg = ConfigManager(CONFIG_PATH)

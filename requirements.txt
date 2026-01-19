@@ -6,3 +6,4 @@ aiohttp
 paho-mqtt
 pyyaml
 blinkpy
+cryptography
