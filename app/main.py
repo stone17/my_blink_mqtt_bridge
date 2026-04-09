@@ -261,9 +261,16 @@ app.mount("/images", StaticFiles(directory="/config/images"), name="images")
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {
-        "request": request, "state": system_state, "data": latest_data, "config": cfg.data, "now": int(time.time())
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html", 
+        context={
+            "state": system_state, 
+            "data": latest_data, 
+            "config": cfg.data, 
+            "now": int(time.time())
+        }
+    )
 
 @app.post("/verify_2fa")
 async def verify_2fa(code: str = Form(...)):
