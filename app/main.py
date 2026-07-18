@@ -198,11 +198,17 @@ async def update_data():
         system_state = "CONNECTED"
     except Exception as e:
         logger.error(f"Update Data Failed: {e}")
+        system_state = "ERROR"
 
 async def perform_action(action_type):
-    if action_type == "arm": await blink_svc.arm_system(True)
-    elif action_type == "disarm": await blink_svc.arm_system(False)
-    await update_data()
+    global system_state
+    try:
+        if action_type == "arm": await blink_svc.arm_system(True)
+        elif action_type == "disarm": await blink_svc.arm_system(False)
+        await update_data()
+    except Exception as e:
+        logger.error(f"Action Failed: {e}")
+        system_state = "ERROR"
 
 async def trigger_snap(target_id):
     # If passed a name via MQTT, we need to resolve it (basic logic)
@@ -236,7 +242,11 @@ async def poll_blink():
                 continue
 
         interval = cfg.data.get("poll_interval", 3600)
-        await asyncio.sleep(interval)
+        for _ in range(interval):
+            if not running or system_state != "CONNECTED":
+                break
+            await asyncio.sleep(1)
+            
         if system_state == "CONNECTED":
             try: await update_data()
             except: system_state = "ERROR"

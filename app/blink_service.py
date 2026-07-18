@@ -89,7 +89,7 @@ class BlinkService:
             return True
         except Exception as e:
             print(f"DEBUG: Arming Exception: {e}")
-            return False
+            raise
 
     async def refresh(self):
         if self.blink:
@@ -150,11 +150,6 @@ class BlinkService:
 
     async def get_status(self):
         if not self.blink: return {}
-        
-        try:
-            await self.refresh() 
-        except Exception as e:
-            print(f"DEBUG: Refresh failed: {e}")
 
         is_armed = False
         cameras = []
