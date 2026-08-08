@@ -3,7 +3,6 @@ import logging
 import os
 import json
 import shutil
-from unittest.mock import patch
 from blinkpy.blinkpy import Blink
 from blinkpy.camera import BlinkCamera
 from blinkpy.auth import Auth, BlinkTwoFARequiredError
@@ -33,17 +32,23 @@ class BlinkService:
     async def login(self, username=None, password=None):
         await self.start_session()
         
-        auth_data = None
+        auth_data = {}
         if os.path.exists(self.creds_path):
             try:
                 auth_data = await json_load(self.creds_path)
             except Exception as e: 
                 print(f"DEBUG: Failed to load existing credentials file: {e}")
+                auth_data = {}
 
-        if not auth_data and username and password:
-            auth_data = {"username": username, "password": password}
+        if not isinstance(auth_data, dict):
+            auth_data = {}
 
-        if not auth_data:
+        if username:
+            auth_data["username"] = username
+        if password:
+            auth_data["password"] = password
+
+        if not auth_data.get("username") or not auth_data.get("password"):
             return "CONFIG_REQUIRED"
 
         self.blink.auth = Auth(auth_data, session=self.session, no_prompt=True)
@@ -51,39 +56,41 @@ class BlinkService:
         try:
             await self.blink.start()
             await self.blink.save(self.creds_path)
-            if hasattr(self.blink, 'urls'):
+            if getattr(self.blink, 'urls', None) and getattr(self.blink.urls, 'base_url', None):
                 print(f"DEBUG: Blink Base URL determined as: {self.blink.urls.base_url}")
             return "SUCCESS"
         except BlinkTwoFARequiredError:
+            print("DEBUG: 2FA required for Blink login")
             return "2FA_REQUIRED"
         except Exception as e:
             print(f"DEBUG: Login failed: {e}")
             return "FAILED"
 
     async def validate_2fa(self, code):
-        if not self.blink or not self.blink.auth: return False
+        if not self.blink or not self.blink.auth:
+            print("DEBUG: 2FA Validation Failed: Blink or Auth not initialized")
+            return False
         try:
-            if hasattr(self.blink.auth, "send_auth_key"):
-                await self.blink.auth.send_auth_key(self.blink, code)
-                await self.blink.setup_post_verify()
+            print("DEBUG: Sending 2FA code...")
+            res = await self.blink.send_2fa_code(code)
+            if res:
+                await self.blink.save(self.creds_path)
+                print("DEBUG: 2FA validation successful, credentials saved")
+                return True
             else:
-                with patch('builtins.input', side_effect=[code]):
-                    await self.blink.prompt_2fa()
-
-            await self.blink.save(self.creds_path)
-            return True
+                print("DEBUG: 2FA verification returned False")
+                return False
         except Exception as e:
-            print(f"DEBUG: 2FA Validation Failed: {e}")
+            print(f"DEBUG: 2FA Validation Exception: {e}")
             return False
 
     async def arm_system(self, arm=True):
         if not self.blink: return False
         print(f"DEBUG: COMMAND -> {'ARM' if arm else 'DISARM'} System")
         try:
-            for name, camera in self.blink.cameras.items():
-                sync_module_name = camera.attributes['sync_module']
-                if sync_module_name in self.blink.sync:
-                    await self.blink.sync[sync_module_name].async_arm(arm)
+            if getattr(self.blink, 'sync', None):
+                for sync_name, sync_module in self.blink.sync.items():
+                    await sync_module.async_arm(arm)
             
             await self.blink.refresh(force_cache=True)
             return True
@@ -103,27 +110,27 @@ class BlinkService:
         
         print(f"DEBUG: Starting Thumbnail Download to {self.images_dir}...")
         
-        # --- FIX: Retrieve Auth Headers ---
-        # The 401 error happens because we weren't passing these headers!
-        headers = self.blink.auth.header
-        # ----------------------------------
+        headers = self.blink.auth.header if getattr(self.blink, 'auth', None) else None
 
         all_devices = []
-        if hasattr(self.blink, 'homescreen'):
+        homescreen = getattr(self.blink, 'homescreen', None)
+        if homescreen and isinstance(homescreen, dict):
             for category in ['owls', 'cameras', 'doorbells', 'chickadees']:
-                devs = self.blink.homescreen.get(category, [])
-                all_devices.extend(devs)
+                devs = homescreen.get(category, [])
+                if isinstance(devs, list):
+                    all_devices.extend(devs)
 
         for dev in all_devices:
+            if not isinstance(dev, dict):
+                continue
             cam_id = str(dev.get('id'))
             name = dev.get('name', 'Unknown')
             thumb_url = dev.get('thumbnail')
             
             if thumb_url:
-                # Construct Full URL
                 if not thumb_url.startswith('http'):
                     base = "https://rest-prod.immedia-semi.com"
-                    if hasattr(self.blink, 'urls') and self.blink.urls.base_url: 
+                    if getattr(self.blink, 'urls', None) and getattr(self.blink.urls, 'base_url', None): 
                         base = self.blink.urls.base_url
                     
                     if base.endswith('/') and thumb_url.startswith('/'):
@@ -136,7 +143,6 @@ class BlinkService:
                 try:
                     path = f"{self.images_dir}/{cam_id}.jpg"
                     
-                    # --- FIX: Pass headers here ---
                     async with self.session.get(full_url, headers=headers) as resp:
                         if resp.status == 200:
                             data = await resp.read()
@@ -154,18 +160,25 @@ class BlinkService:
         is_armed = False
         cameras = []
         
-        if hasattr(self.blink, 'homescreen') and 'networks' in self.blink.homescreen:
-            for net in self.blink.homescreen['networks']:
-                if net.get('armed') is True:
-                    is_armed = True
-                    break
+        homescreen = getattr(self.blink, 'homescreen', None)
+        if homescreen and isinstance(homescreen, dict) and 'networks' in homescreen:
+            networks = homescreen.get('networks')
+            if isinstance(networks, list):
+                for net in networks:
+                    if isinstance(net, dict) and net.get('armed') is True:
+                        is_armed = True
+                        break
         
         raw_devices = []
-        if hasattr(self.blink, 'homescreen'):
+        if homescreen and isinstance(homescreen, dict):
             for category in ['owls', 'cameras', 'doorbells', 'chickadees']:
-                for item in self.blink.homescreen.get(category, []):
-                    item['category_type'] = category
-                    raw_devices.append(item)
+                items = homescreen.get(category, [])
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict):
+                            item_copy = item.copy()
+                            item_copy['category_type'] = category
+                            raw_devices.append(item_copy)
 
         name_counts = {}
         for d in raw_devices:
@@ -186,10 +199,11 @@ class BlinkService:
                 online = (dev['status'] != 'offline')
 
             temp = 0
-            for _, c_obj in self.blink.cameras.items():
-                if str(c_obj.camera_id) == cam_id:
-                    temp = c_obj.attributes.get('temperature', 0)
-                    break
+            if getattr(self.blink, 'cameras', None):
+                for _, c_obj in self.blink.cameras.items():
+                    if str(getattr(c_obj, 'camera_id', '')) == cam_id:
+                        temp = getattr(c_obj, 'attributes', {}).get('temperature', 0)
+                        break
 
             cameras.append({
                 "name": display_name,
@@ -201,7 +215,7 @@ class BlinkService:
             })
 
         debug_data = {
-            "networks_raw": self.blink.homescreen.get('networks', []) if hasattr(self.blink, 'homescreen') else "No Data",
+            "networks_raw": homescreen.get('networks', []) if (homescreen and isinstance(homescreen, dict)) else "No Data",
             "all_raw_devices": raw_devices
         }
 
@@ -219,20 +233,26 @@ class BlinkService:
         print(f"DEBUG: Requesting SNAP for Camera ID {target_id}...")
 
         target_cam = None
-        for _, cam in self.blink.cameras.items():
-            if str(cam.camera_id) == target_id:
-                target_cam = cam
-                break
+        if getattr(self.blink, 'cameras', None):
+            for _, cam in self.blink.cameras.items():
+                if str(getattr(cam, 'camera_id', '')) == target_id:
+                    target_cam = cam
+                    break
         
         if not target_cam:
             print(f"DEBUG: Reconstructing camera object for ID {target_id}...")
             raw_data = None
-            if hasattr(self.blink, 'homescreen'):
+            homescreen = getattr(self.blink, 'homescreen', None)
+            if homescreen and isinstance(homescreen, dict):
                 for cat in ['owls', 'cameras', 'doorbells', 'chickadees']:
-                    for item in self.blink.homescreen.get(cat, []):
-                        if str(item.get('id')) == target_id:
-                            raw_data = item
-                            break
+                    items = homescreen.get(cat, [])
+                    if isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict) and str(item.get('id')) == target_id:
+                                raw_data = item
+                                break
+                    if raw_data:
+                        break
             
             if raw_data:
                 target_cam = BlinkCamera(self.blink)

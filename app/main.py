@@ -138,8 +138,6 @@ class MqttHandler:
 
         if "snap" in topic:
             try:
-                # Warning: MQTT still uses name in topic. 
-                # This logic assumes unique names or picks first match.
                 cam_name = topic.split("/")[2]
                 asyncio.run_coroutine_threadsafe(trigger_snap(cam_name), loop)
             except: pass
@@ -211,8 +209,6 @@ async def perform_action(action_type):
         system_state = "ERROR"
 
 async def trigger_snap(target_id):
-    # If passed a name via MQTT, we need to resolve it (basic logic)
-    # But UI passes ID now.
     await blink_svc.snap_picture(target_id)
     await update_data()
 
@@ -220,25 +216,32 @@ async def poll_blink():
     global system_state
     while running:
         if system_state == "WAITING_2FA":
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
             continue
             
         if system_state != "CONNECTED":
             u = cfg.data.get("blink_email")
             p = cfg.data.get("blink_password")
+            if not u or not p:
+                system_state = "CONFIG_REQUIRED"
+                await asyncio.sleep(2)
+                continue
+
             res = await blink_svc.login(username=u, password=p)
             if res == "SUCCESS":
                 system_state = "CONNECTED"
                 await update_data()
             elif res == "2FA_REQUIRED":
                 system_state = "WAITING_2FA"
+                await asyncio.sleep(2)
+                continue
             elif res == "CONFIG_REQUIRED":
                 system_state = "CONFIG_REQUIRED"
                 await asyncio.sleep(2)
                 continue
             else:
                 system_state = "ERROR"
-                await asyncio.sleep(30)
+                await asyncio.sleep(10)
                 continue
 
         interval = cfg.data.get("poll_interval", 3600)
@@ -248,8 +251,11 @@ async def poll_blink():
             await asyncio.sleep(1)
             
         if system_state == "CONNECTED":
-            try: await update_data()
-            except: system_state = "ERROR"
+            try:
+                await update_data()
+            except Exception as e:
+                logger.error(f"Poll refresh failed: {e}")
+                system_state = "ERROR"
 
 # --- FASTAPI ---
 @asynccontextmanager
@@ -288,6 +294,8 @@ async def verify_2fa(code: str = Form(...)):
     if await blink_svc.validate_2fa(code):
         system_state = "CONNECTED"
         await update_data()
+    else:
+        system_state = "ERROR"
     return RedirectResponse("/", status_code=303)
 
 @app.post("/snap/{target_id}")
@@ -316,6 +324,5 @@ async def save_config(
     cfg.save()
     mqtt.client.disconnect()
     mqtt.start()
-    if system_state in ["ERROR", "CONFIG_REQUIRED"]:
-        system_state = "STARTING"
+    system_state = "STARTING"
     return RedirectResponse("/", status_code=303)
